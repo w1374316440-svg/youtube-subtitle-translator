@@ -15,11 +15,6 @@
       "dest": "vercel_web_app.py"
     }
   ],
-  "functions": {
-    "vercel_web_app.py": {
-      "runtime": "python3.9"
-    }
-  },
   "env": {
     "PYTHON_VERSION": "3.9"
   }
