@@ -317,7 +317,7 @@ HTML_TEMPLATE = '''
                 }
 
                 extractedSubtitles = resultJson.subtitles || [];
-                document.getElementById('subtitle_content').textContent = extractedSubtitles.join('\n');
+                document.getElementById('subtitle_content').textContent = extractedSubtitles.join('\\n');
                 document.getElementById('subtitle_panel').style.display = 'flex';
                 document.getElementById('deepseek_panel').style.display = 'flex';
                 ensurePanelsVisible();
@@ -406,10 +406,10 @@ HTML_TEMPLATE = '''
                     const { value, done } = await reader.read();
                     if (done) break;
                     buffer += decoder.decode(value, { stream: true });
-                    const parts = buffer.split('\n\n');
+                    const parts = buffer.split('\\n\\n');
                     buffer = parts.pop() || '';
                     for (const part of parts) {
-                        const line = part.split('\n').find(l => l.startsWith('data: '));
+                        const line = part.split('\\n').find(l => l.startsWith('data: '));
                         if (!line) continue;
                         const data = line.slice(6).trim();
                         if (data === '[DONE]') {
