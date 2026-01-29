@@ -5,10 +5,9 @@ Vercel兼容的Web版本 - 使用Flask框架
 支持Vercel Serverless Functions部署
 """
 
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, Response
 import os
 import json
-import tempfile
 from downloader import download_subtitles
 from translator import translate_subtitles
 from feishu_uploader import get_tenant_access_token, upload_file_to_wiki
@@ -120,6 +119,69 @@ HTML_TEMPLATE = '''
             margin-right: 10px;
         }
     </style>
+    <style>
+        .panels {
+            position: fixed;
+            left: 50%;
+            transform: translateX(-50%);
+            bottom: 20px;
+            width: 800px;
+            max-width: calc(100vw - 40px);
+            display: flex;
+            gap: 12px;
+            z-index: 9999;
+        }
+        .subtitle-panel, .deepseek-panel {
+            flex: 1;
+            background: #fff;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            display: flex;
+            flex-direction: column;
+            max-height: 45vh;
+            box-shadow: 0 8px 20px rgba(0,0,0,0.12);
+        }
+        .panel-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 12px;
+            background: #f8f9fa;
+            border-bottom: 1px solid #ddd;
+        }
+        .panel-title { font-weight: bold; color: #333; }
+        .panel-controls button {
+            width: auto;
+            padding: 0 8px;
+            background: transparent;
+            border: none;
+            font-size: 18px;
+            cursor: pointer;
+            color: #333;
+        }
+        .panel-body {
+            flex: 1; overflow: hidden; display: flex; flex-direction: column;
+        }
+        .subtitle-content {
+            flex: 1; overflow-y: auto; padding: 15px; white-space: pre-wrap; font-size: 14px; line-height: 1.6;
+        }
+        .chat-history {
+            flex: 1; overflow-y: auto; padding: 15px; border-bottom: 1px solid #eee;
+        }
+        .chat-input-area {
+            display: flex; padding: 10px; gap: 10px;
+        }
+        .chat-input-area textarea {
+            flex: 1; min-height: 60px; resize: vertical;
+        }
+        .chat-input-area button {
+            width: auto; padding: 10px 20px; background-color: #28a745;
+        }
+        .minimized .panel-body { display: none; }
+        .chat-msg { margin-bottom: 10px; }
+        .chat-msg .role { font-weight: bold; margin-bottom: 4px; }
+        .chat-msg .content { white-space: pre-wrap; line-height: 1.6; }
+    </style>
 </head>
 <body>
     <div class="container">
@@ -163,21 +225,221 @@ HTML_TEMPLATE = '''
             <input type="url" id="video_url" placeholder="https://www.youtube.com/watch?v=...">
         </div>
         
+        <button onclick="extractSubtitles()" id="extract_btn" style="background-color:#28a745">提取字幕</button>
         <button onclick="startTranslation()" id="translate_btn">开始翻译</button>
+        
+        <div id="panels" class="panels" style="display:none;">
+          <div class="subtitle-panel" id="subtitle_panel">
+            <div class="panel-header">
+              <span class="panel-title">字幕内容</span>
+              <div class="panel-controls">
+                <button onclick="toggleMinimize('subtitle')" title="最小化">—</button>
+                <button onclick="closePanel('subtitle')" title="关闭">×</button>
+              </div>
+            </div>
+            <div class="panel-body" id="subtitle_body">
+              <div class="subtitle-content" id="subtitle_content"></div>
+            </div>
+          </div>
+          
+          <div class="deepseek-panel" id="deepseek_panel">
+            <div class="panel-header">
+              <span class="panel-title">DeepSeek 交互</span>
+              <div class="panel-controls">
+                <button onclick="toggleMinimize('deepseek')" title="最小化">—</button>
+                <button onclick="closePanel('deepseek')" title="关闭">×</button>
+              </div>
+            </div>
+            <div class="panel-body" id="deepseek_body">
+              <div class="chat-history" id="chat_history"></div>
+              <div class="chat-input-area">
+                <textarea id="deepseek_input" placeholder="输入你的指令，例如：翻译为中文、总结核心观点、解释术语..."></textarea>
+                <button onclick="sendToDeepseek()" id="deepseek_send">发送</button>
+              </div>
+            </div>
+          </div>
+        </div>
         
         <div id="result" class="result" style="display: none;"></div>
     </div>
 
     <script>
-        // 显示/隐藏飞书配置
         document.getElementById('enable_feishu').addEventListener('change', function() {
             const feishuConfig = document.getElementById('feishu_config');
             feishuConfig.style.display = this.checked ? 'block' : 'none';
         });
+
+        let extractedSubtitles = [];
+        let chatMessages = [];
+
+        function ensurePanelsVisible() {
+            document.getElementById('panels').style.display = 'flex';
+        }
+
+        function closePanel(which) {
+            const panelId = which === 'subtitle' ? 'subtitle_panel' : 'deepseek_panel';
+            const el = document.getElementById(panelId);
+            el.style.display = 'none';
+            const leftVisible = document.getElementById('subtitle_panel').style.display !== 'none';
+            const rightVisible = document.getElementById('deepseek_panel').style.display !== 'none';
+            if (!leftVisible && !rightVisible) {
+                document.getElementById('panels').style.display = 'none';
+            }
+        }
+
+        function toggleMinimize(which) {
+            const panelId = which === 'subtitle' ? 'subtitle_panel' : 'deepseek_panel';
+            document.getElementById(panelId).classList.toggle('minimized');
+        }
+
+        async function extractSubtitles() {
+            const btn = document.getElementById('extract_btn');
+            const videoUrl = document.getElementById('video_url').value.trim();
+            const cookieText = document.getElementById('cookie_text').value.trim();
+            if (!videoUrl) {
+                showResult('请先填写 YouTube 视频链接！', 'error');
+                return;
+            }
+
+            btn.disabled = true;
+            btn.textContent = '提取中...';
+            try {
+                showResult('正在提取字幕，请稍候...', 'loading');
+                const response = await fetch('/api/extract', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ video_url: videoUrl, cookie_text: cookieText })
+                });
+                const resultJson = await response.json();
+                if (!response.ok || !resultJson.success) {
+                    showResult(`❌ 提取失败: ${resultJson.error || '未知错误'}`, 'error');
+                    return;
+                }
+
+                extractedSubtitles = resultJson.subtitles || [];
+                document.getElementById('subtitle_content').textContent = extractedSubtitles.join('\n');
+                document.getElementById('subtitle_panel').style.display = 'flex';
+                document.getElementById('deepseek_panel').style.display = 'flex';
+                ensurePanelsVisible();
+                showResult(`✅ 已提取字幕：${resultJson.title || ''}`, 'success');
+            } catch (e) {
+                showResult(`❌ 网络错误: ${e.message}`, 'error');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = '提取字幕';
+            }
+        }
+
+        function appendChatMessage(role, content) {
+            const historyEl = document.getElementById('chat_history');
+            const wrapper = document.createElement('div');
+            wrapper.className = 'chat-msg';
+
+            const roleEl = document.createElement('div');
+            roleEl.className = 'role';
+            roleEl.textContent = role === 'user' ? '你' : 'DeepSeek';
+
+            const contentEl = document.createElement('div');
+            contentEl.className = 'content';
+            contentEl.textContent = content;
+
+            wrapper.appendChild(roleEl);
+            wrapper.appendChild(contentEl);
+            historyEl.appendChild(wrapper);
+            historyEl.scrollTop = historyEl.scrollHeight;
+            return contentEl;
+        }
+
+        async function sendToDeepseek() {
+            const deepseekKey = document.getElementById('deepseek_key').value.trim();
+            const instruction = document.getElementById('deepseek_input').value.trim();
+            const sendBtn = document.getElementById('deepseek_send');
+            if (!deepseekKey) {
+                showResult('请先填写 DeepSeek API 密钥！', 'error');
+                return;
+            }
+            if (!instruction) {
+                showResult('请输入你的指令！', 'error');
+                return;
+            }
+            if (!extractedSubtitles.length) {
+                showResult('请先点击“提取字幕”获取字幕内容！', 'error');
+                return;
+            }
+
+            const selection = window.getSelection ? window.getSelection().toString().trim() : '';
+            const subtitlesToSend = selection ? [selection] : extractedSubtitles;
+
+            const historyToSend = chatMessages.slice();
+            appendChatMessage('user', instruction);
+            const assistantEl = appendChatMessage('assistant', '');
+
+            sendBtn.disabled = true;
+            sendBtn.textContent = '发送中...';
+            document.getElementById('deepseek_input').value = '';
+
+            let assistantText = '';
+            try {
+                const response = await fetch('/api/deepseek', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        deepseek_key: deepseekKey,
+                        instruction,
+                        subtitles: subtitlesToSend,
+                        history: historyToSend
+                    })
+                });
+
+                if (!response.ok) {
+                    const errJson = await response.json().catch(() => ({}));
+                    showResult(`❌ 请求失败: ${errJson.error || '未知错误'}`, 'error');
+                    assistantEl.textContent = `请求失败：${errJson.error || '未知错误'}`;
+                    return;
+                }
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder('utf-8');
+                let buffer = '';
+
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    buffer += decoder.decode(value, { stream: true });
+                    const parts = buffer.split('\n\n');
+                    buffer = parts.pop() || '';
+                    for (const part of parts) {
+                        const line = part.split('\n').find(l => l.startsWith('data: '));
+                        if (!line) continue;
+                        const data = line.slice(6).trim();
+                        if (data === '[DONE]') {
+                            buffer = '';
+                            break;
+                        }
+                        try {
+                            const obj = JSON.parse(data);
+                            const delta = obj.delta || '';
+                            assistantText += delta;
+                            assistantEl.textContent = assistantText;
+                        } catch (e) {
+                        }
+                    }
+                }
+
+                chatMessages.push({ role: 'user', content: instruction });
+                chatMessages.push({ role: 'assistant', content: assistantText });
+            } catch (e) {
+                showResult(`❌ 网络错误: ${e.message}`, 'error');
+                assistantEl.textContent = `网络错误：${e.message}`;
+            } finally {
+                sendBtn.disabled = false;
+                sendBtn.textContent = '发送';
+            }
+        }
         
         async function startTranslation() {
             const btn = document.getElementById('translate_btn');
-            const result = document.getElementById('result');
+            const resultEl = document.getElementById('result');
             
             // 获取输入值
             const deepseekKey = document.getElementById('deepseek_key').value.trim();
@@ -247,10 +509,10 @@ HTML_TEMPLATE = '''
         }
         
         function showResult(message, type) {
-            const result = document.getElementById('result');
-            result.innerHTML = message;
-            result.className = 'result ' + type;
-            result.style.display = 'block';
+            const resultEl = document.getElementById('result');
+            resultEl.innerHTML = message;
+            resultEl.className = 'result ' + type;
+            resultEl.style.display = 'block';
         }
     </script>
 </body>
@@ -346,6 +608,97 @@ def translate():
         
     except Exception as e:
         print(f"处理过程中出错: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/extract', methods=['POST'])
+def extract():
+    """提取字幕并返回原始文本"""
+    try:
+        data = request.get_json()
+        video_url = data.get('video_url')
+        cookie_text = data.get('cookie_text', '')
+        if not video_url:
+            return jsonify({'success': False, 'error': '缺少视频链接'}), 400
+        
+        # 处理cookie
+        cookie_file = None
+        if cookie_text:
+            cookie_file = os.path.join(TEMP_DIR, 'cookies_netscape.txt')
+            with open(cookie_file, 'w') as f:
+                f.write("# Netscape HTTP Cookie File\n")
+                f.write("# Generated by YouTube Subtitle Translator\n\n")
+                cookies = cookie_text.strip().split(';')
+                for cookie in cookies:
+                    cookie = cookie.strip()
+                    if '=' in cookie:
+                        name, value = cookie.split('=', 1)
+                        f.write(f".youtube.com\tTRUE\t/\tFALSE\t0\t{name.strip()}\t{value.strip()}\n")
+        
+        vtt_path, video_title = download_subtitles(video_url, TEMP_DIR, cookie_file)
+        if not vtt_path:
+            return jsonify({'success': False, 'error': '字幕提取失败'}), 500
+        
+        # 读取字幕内容
+        import webvtt
+        captions = webvtt.read(vtt_path)
+        lines = []
+        for caption in captions:
+            text = caption.text.replace('\n', ' ').strip()
+            if text:
+                lines.append(text)
+        
+        return jsonify({
+            'success': True,
+            'title': video_title,
+            'subtitles': lines
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/deepseek', methods=['POST'])
+def deepseek_chat():
+    """接收字幕+指令，流式返回答案"""
+    try:
+        data = request.get_json()
+        subtitles = data.get('subtitles', [])
+        instruction = data.get('instruction', '')
+        api_key = data.get('deepseek_key', '')
+        history = data.get('history', [])
+        if not subtitles or not instruction or not api_key:
+            return jsonify({'success': False, 'error': '缺少参数'}), 400
+        
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+        
+        text_block = '\n'.join(subtitles)
+        system_prompt = (
+            "你是专业字幕助手。请严格按照用户指令处理下方字幕，"
+            "直接输出结果，不要多余解释。字幕内容如下：\n\n" + text_block
+        )
+        
+        messages = [{"role": "system", "content": system_prompt}]
+        if isinstance(history, list):
+            for item in history:
+                role = item.get('role')
+                content = item.get('content')
+                if role in ('user', 'assistant') and isinstance(content, str) and content.strip():
+                    messages.append({"role": role, "content": content})
+        messages.append({"role": "user", "content": instruction})
+
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=messages,
+            stream=True
+        )
+        
+        def generate():
+            for chunk in response:
+                delta = chunk.choices[0].delta.content or ''
+                yield f"data: {json.dumps({'delta': delta})}\n\n"
+            yield "data: [DONE]\n\n"
+        
+        return Response(generate(), mimetype='text/event-stream', headers={'Cache-Control': 'no-cache'})
+    except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/download/<filename>')
